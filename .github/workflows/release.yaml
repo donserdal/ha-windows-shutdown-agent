@@ -1,0 +1,234 @@
+# ══════════════════════════════════════════════════════════════════════════════
+#  HA Windows Shutdown Client – Build & Release
+#
+#  Triggers:
+#    • Push van een versietag  v*.*.*  →  volledige build + GitHub Release
+#    • Pull request op main           →  alleen build + vet (geen release)
+#    • Handmatig via "Run workflow"   →  kies zelf of je een release wilt
+#
+#  Artefacten:
+#    • ha-shutdown-client.exe  (release-modus: geen consolevenster, icoon ingebakken)
+#    • SHA-256 checksum bestand
+#
+#  Vereisten in de repository:
+#    • Go-broncode staat in de map  client_go/
+#    • go.sum is gecommit (zodat de build reproduceerbaar is)
+# ══════════════════════════════════════════════════════════════════════════════
+
+name: Build & Release
+
+on:
+  push:
+    tags:
+      - "v*.*.*"           # v1.0.0, v1.2.3-beta, etc.
+  pull_request:
+    branches:
+      - main
+  workflow_dispatch:
+    inputs:
+      create_release:
+        description: "Maak een GitHub Release aan?"
+        required: true
+        type: boolean
+        default: false
+
+# Voorkom dat gelijktijdige runs elkaar overschrijven.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Build (Windows amd64)
+    runs-on: windows-latest        # Windows runner: vereist voor cgo + walk
+
+    defaults:
+      run:
+        working-directory: client_go  # alle stappen draaien in de bronmap
+
+    env:
+      GOOS: windows
+      GOARCH: amd64
+      APPNAME: ha-shutdown-client
+      CGO_ENABLED: 1                 # walk vereist cgo
+
+    steps:
+      # ── 1. Broncode ophalen ─────────────────────────────────────────────────
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0             # volledige geschiedenis voor git describe
+
+      # ── 2. Go toolchain instellen ───────────────────────────────────────────
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: client_go/go.mod   # respecteer de versie uit go.mod
+          cache-dependency-path: client_go/go.sum
+
+      # ── 3. Versienummer bepalen ─────────────────────────────────────────────
+      # Bij een tag: gebruik de tagnaam (bijv. "v1.2.0" → "1.2.0")
+      # Bij een PR/branch: gebruik de korte commit-hash
+      - name: Determine version
+        id: version
+        shell: bash
+        run: |
+          if [[ "${{ github.ref_type }}" == "tag" ]]; then
+            VERSION="${{ github.ref_name }}"
+            VERSION_BARE="${VERSION#v}"   # verwijder voorloopende 'v'
+          else
+            VERSION="dev-$(git rev-parse --short HEAD)"
+            VERSION_BARE="$VERSION"
+          fi
+          echo "version=$VERSION"      >> "$GITHUB_OUTPUT"
+          echo "version_bare=$VERSION_BARE" >> "$GITHUB_OUTPUT"
+          echo "Bouwen versie: $VERSION"
+
+      # ── 4. Afhankelijkheden ophalen ─────────────────────────────────────────
+      - name: Go mod tidy
+        run: go mod tidy
+
+      # ── 5. rsrc installeren en resources inbakken ───────────────────────────
+      # rsrc genereert rsrc.syso met het app.manifest (comctl32 v6 + DPI) en
+      # het .ico-bestand (zichtbaar in Verkenner en taakbalk).
+      - name: Install rsrc
+        run: go install github.com/akavel/rsrc@latest
+
+      - name: Embed manifest + icon
+        run: >
+          rsrc
+          -manifest app.manifest
+          -ico homeassistant_windows_shutdown.ico
+          -o rsrc.syso
+
+      # ── 6. Code controleren ─────────────────────────────────────────────────
+      # -unsafeptr=false: clipboard.go gebruikt uintptr→unsafe.Pointer voor
+      # Windows-heap geheugen (GlobalAlloc). De Go GC beheert dit niet en zal
+      # het nooit verplaatsen; de conversie is altijd geldig. go vet herkent
+      # dit patroon niet en geeft een false positive. Alle overige checks actief.
+      - name: go vet
+        run: go vet -unsafeptr=false ./...
+
+      # ── 7. Bouwen ───────────────────────────────────────────────────────────
+      # -s -w        : stripsymbolen + DWARF-info → kleinere binary
+      # -H windowsgui: geen consolevenster in productie
+      # -X main.version: injecteer het versienummer in de binary
+      - name: Build release binary
+        run: >
+          go build
+          -ldflags="-s -w -H windowsgui -X main.version=${{ steps.version.outputs.version_bare }}"
+          -o "${{ env.APPNAME }}.exe"
+          .
+
+      # ── 8. Checksum berekenen ───────────────────────────────────────────────
+      - name: Compute SHA-256 checksum
+        id: checksum
+        shell: pwsh
+        run: |
+          $hash = (Get-FileHash "${{ env.APPNAME }}.exe" -Algorithm SHA256).Hash.ToLower()
+          "$hash  ${{ env.APPNAME }}.exe" | Out-File -Encoding utf8 "${{ env.APPNAME }}.exe.sha256"
+          echo "sha256=$hash" >> $env:GITHUB_OUTPUT
+          Write-Host "SHA-256: $hash"
+
+      # ── 9. Artefacten uploaden (altijd: PR's, branches én tags) ─────────────
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: ha-shutdown-client-${{ steps.version.outputs.version }}
+          path: |
+            client_go/${{ env.APPNAME }}.exe
+            client_go/${{ env.APPNAME }}.exe.sha256
+          retention-days: 30
+          if-no-files-found: error
+
+  # ────────────────────────────────────────────────────────────────────────────
+  release:
+    name: GitHub Release
+    needs: build
+    runs-on: ubuntu-latest
+
+    # Alleen uitvoeren bij een versietag OF een handmatige run met create_release=true
+    if: |
+      github.ref_type == 'tag' ||
+      (github.event_name == 'workflow_dispatch' && inputs.create_release == true)
+
+    # Vereiste rechten voor het aanmaken van een release en het uploaden van assets
+    permissions:
+      contents: write
+
+    steps:
+      # ── 1. Broncode ophalen (voor de changelog) ─────────────────────────────
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      # ── 2. Versienummer overnemen van de build-job ──────────────────────────
+      - name: Determine version
+        id: version
+        run: |
+          if [[ "${{ github.ref_type }}" == "tag" ]]; then
+            VERSION="${{ github.ref_name }}"
+          else
+            VERSION="dev-$(git rev-parse --short HEAD)"
+          fi
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+
+      # ── 3. Build-artefacten downloaden ──────────────────────────────────────
+      - name: Download build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: ha-shutdown-client-${{ steps.version.outputs.version }}
+          path: dist/
+
+      # ── 4. Changelog genereren uit git log ──────────────────────────────────
+      # Toont commits tussen de vorige tag en de huidige — netjes als release notes.
+      - name: Generate changelog
+        id: changelog
+        run: |
+          PREV_TAG=$(git describe --tags --abbrev=0 HEAD^ 2>/dev/null || echo "")
+          if [ -n "$PREV_TAG" ]; then
+            RANGE="${PREV_TAG}..HEAD"
+            SINCE="Wijzigingen sinds **${PREV_TAG}**:"
+          else
+            RANGE="HEAD"
+            SINCE="Eerste release:"
+          fi
+
+          COMMITS=$(git log "$RANGE" --pretty=format:"- %s (%h)" --no-merges | head -50)
+
+          cat >> "$GITHUB_OUTPUT" << EOF
+          notes<<ENDOFNOTES
+          ## HA Shutdown Client ${{ steps.version.outputs.version }}
+
+          $SINCE
+
+          $COMMITS
+
+          ---
+          ### Installatie
+          1. Download **ha-shutdown-client.exe**
+          2. Voer de exe uit — het icoontje verschijnt in het systeemvak
+          3. Open *Verbindingsinfo* voor de API-sleutel en voer deze in Home Assistant in
+
+          ### Verificatie
+          Controleer de integriteit van de download met het bijgeleverde \`.sha256\`-bestand:
+          \`\`\`powershell
+          Get-FileHash ha-shutdown-client.exe -Algorithm SHA256
+          \`\`\`
+          ENDOFNOTES
+          EOF
+
+      # ── 5. GitHub Release aanmaken en assets uploaden ───────────────────────
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.version.outputs.version }}
+          name: "HA Shutdown Client ${{ steps.version.outputs.version }}"
+          body: ${{ steps.changelog.notes }}
+          draft: false
+          prerelease: ${{ contains(steps.version.outputs.version, '-') }}
+          files: |
+            dist/ha-shutdown-client.exe
+            dist/ha-shutdown-client.exe.sha256
+          fail_on_unmatched_files: true
