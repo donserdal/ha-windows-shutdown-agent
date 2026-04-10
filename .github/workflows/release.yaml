@@ -1,0 +1,138 @@
+name: Build & Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  pull_request:
+    branches:
+      - main
+
+jobs:
+  validate:
+    name: Validate Build
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.21'
+          cache: true
+
+      - name: Install Dependencies
+        working-directory: client_go
+        run: |
+          go mod download
+          go mod tidy
+
+      # Handmatige installatie en uitvoer van golangci-lint om directory-problemen te omzeilen
+      - name: Install golangci-lint
+        working-directory: client_go
+        run: |
+          # Download en installeer de nieuwste versie van golangci-lint
+          powershell -Command "iwr -useb https://raw.githubusercontent.com/golangci/golangci-lint/master/install.ps1 | iex"
+          # Zorg dat de binary in de PATH zit (optioneel, maar handig voor volgende stappen)
+          $env:PATH = "$PWD\bin;$env:PATH"
+
+      - name: Run Linter
+        working-directory: client_go
+        run: |
+          # Voer de linter uit in de client_go map
+          .\bin\golangci-lint.exe run --timeout=5m
+
+      - name: Build Debug Version
+        working-directory: client_go
+        run: |
+          go build -o ha-shutdown-client-debug.exe .
+          if (-Not (Test-Path ha-shutdown-client-debug.exe)) { exit 1 }
+          Write-Host "Debug build successful"
+
+      - name: Build Release Version (GUI)
+        working-directory: client_go
+        run: |
+          go build -ldflags="-s -w -H windowsgui" -o ha-shutdown-client-release.exe .
+          if (-Not (Test-Path ha-shutdown-client-release.exe)) { exit 1 }
+          Write-Host "Release build successful (GUI mode)"
+
+      - name: Upload Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-artifacts
+          path: |
+            client_go/ha-shutdown-client-debug.exe
+            client_go/ha-shutdown-client-release.exe
+          retention-days: 1
+
+  release:
+    name: Create GitHub Release
+    runs-on: ubuntu-latest
+    needs: validate
+    if: startsWith(github.ref, 'refs/tags/v')
+
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.21'
+
+      - name: Determine Version
+        id: version
+        run: |
+          TAG=${GITHUB_REF#refs/tags/}
+          VERSION=${TAG#v}
+          echo "tag=$TAG" >> $GITHUB_OUTPUT
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+          echo "Version detected: $VERSION"
+
+      - name: Build Release Binary
+        working-directory: client_go
+        run: |
+          go mod download
+          go build -ldflags="-s -w -H windowsgui" -o ha-shutdown-client.exe .
+          ls -lh ha-shutdown-client.exe
+
+      - name: Extract Changelog
+        id: changelog
+        run: |
+          VERSION="${{ steps.version.outputs.version }}"
+          NOTES=$(awk "/^## \[$VERSION\]/{found=1; next} found && /^## \[/{exit} found{print}" CHANGELOG.md)
+          
+          if [ -z "$NOTES" ]; then
+            NOTES="No changelog entries found for this version."
+          fi
+          
+          echo "notes<<EOF" >> $GITHUB_OUTPUT
+          echo "$NOTES" >> $GITHUB_OUTPUT
+          echo "EOF" >> $GITHUB_OUTPUT
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.version.outputs.tag }}
+          name: "HA Windows Shutdown Client v${{ steps.version.outputs.version }}"
+          body: |
+            ## 🚀 Release v${{ steps.version.outputs.version }}
+            
+            ### Changes
+            ${{ steps.changelog.outputs.notes }}
+            
+            ### Installation
+            Download `ha-shutdown-client.exe` and double-click to start.
+            
+            ### Security Note
+            The API key is encrypted and stored in the Windows Registry.
+          files: client_go/ha-shutdown-client.exe
+          draft: false
+          prerelease: false

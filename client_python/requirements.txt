@@ -1,0 +1,9 @@
+# HA Windows Shutdown Client – vereiste pakketten
+# Installeer met: pip install -r requirements.txt
+
+flask>=3.0.0
+cryptography>=42.0.0
+zeroconf>=0.132.0
+pystray>=0.19.5
+Pillow>=10.0.0
+pyinstaller>=6.0.0   ; extra == "build"   # alleen nodig voor .exe-bouw
