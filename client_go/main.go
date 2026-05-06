@@ -18,6 +18,7 @@ import (
 )
 
 const version = "1.0.0"
+const appName = "HA Shutdown Client"
 
 func main() {
 	// ── Vlag-definities ──────────────────────────────────────────────────────

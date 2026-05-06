@@ -108,6 +108,7 @@ func newServer(cfg *Config) *http.Server {
 	mux.HandleFunc("/shutdown", withAuth(func(w http.ResponseWriter, r *http.Request) {
 		handleShutdown(w, r, cfg)
 	}))
+	mux.HandleFunc("/notify", withAuth(handleNotify))
 
 	return &http.Server{
 		Addr:              fmt.Sprintf(":%d", cfg.Port),
